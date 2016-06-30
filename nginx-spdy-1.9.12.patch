@@ -1,0 +1,679 @@
+diff -rupN '--exclude=spdy' a/auto/make b/auto/make
+--- a/auto/make	2016-02-25 01:23:23.000000000 +1030
++++ b/auto/make	2016-02-25 22:46:55.096212795 +1030
+@@ -7,7 +7,7 @@ echo "creating $NGX_MAKEFILE"
+ 
+ mkdir -p $NGX_OBJS/src/core $NGX_OBJS/src/event $NGX_OBJS/src/event/modules \
+          $NGX_OBJS/src/os/unix $NGX_OBJS/src/os/win32 \
+-         $NGX_OBJS/src/http $NGX_OBJS/src/http/v2 $NGX_OBJS/src/http/modules \
++         $NGX_OBJS/src/http $NGX_OBJS/src/http/v2 $NGX_OBJS/src/http/spdy $NGX_OBJS/src/http/modules \
+          $NGX_OBJS/src/http/modules/perl \
+          $NGX_OBJS/src/mail \
+          $NGX_OBJS/src/stream \
+diff -rupN '--exclude=spdy' a/auto/modules b/auto/modules
+--- a/auto/modules	2016-02-25 01:23:23.000000000 +1030
++++ b/auto/modules	2016-02-25 23:49:13.774751900 +1030
+@@ -139,6 +139,7 @@ fi
+ #     ngx_http_header_filter
+ #     ngx_http_chunked_filter
+ #     ngx_http_v2_filter
++#     ngx_http_spdy_filter
+ #     ngx_http_range_header_filter
+ #     ngx_http_gzip_filter
+ #     ngx_http_postpone_filter
+@@ -171,6 +172,7 @@ ngx_module_order="ngx_http_static_module
+                   ngx_http_header_filter_module \
+                   ngx_http_chunked_filter_module \
+                   ngx_http_v2_filter_module \
++                  ngx_http_spdy_filter_module \
+                   ngx_http_range_header_filter_module \
+                   ngx_http_gzip_filter_module \
+                   ngx_http_postpone_filter_module \
+@@ -232,6 +234,17 @@ if [ $HTTP_V2 = YES ]; then
+     . auto/module
+ fi
+ 
++if [ $HTTP_SPDY = YES ]; then
++    ngx_module_name=ngx_http_spdy_filter_module
++    ngx_module_incs=
++    ngx_module_deps=
++    ngx_module_srcs=src/http/spdy/ngx_http_spdy_filter_module.c
++    ngx_module_libs=
++    ngx_module_link=$HTTP_SPDY
++
++    . auto/module
++fi
++
+ if :; then
+     ngx_module_name=ngx_http_range_header_filter_module
+     ngx_module_incs=
+@@ -439,6 +452,19 @@ if [ $HTTP_V2 = YES ]; then
+ 
+     . auto/module
+ fi
++
++if [ $HTTP_SPDY = YES ]; then
++    have=NGX_HTTP_SPDY . auto/have
++
++    ngx_module_name=ngx_http_spdy_module
++    ngx_module_incs=src/http/spdy
++    ngx_module_deps="src/http/spdy/ngx_http_spdy.h src/http/spdy/ngx_http_spdy_module.h"
++    ngx_module_srcs="src/http/spdy/ngx_http_spdy.c src/http/spdy/ngx_http_spdy_module.c"
++    ngx_module_libs=
++    ngx_module_link=$HTTP_SPDY
++
++    . auto/module
++fi
+ 
+ if :; then
+     ngx_module_name=ngx_http_static_module
+diff -rupN '--exclude=spdy' a/auto/options b/auto/options
+--- a/auto/options	2016-02-25 01:23:23.000000000 +1030
++++ b/auto/options	2016-02-25 22:52:26.801857634 +1030
+@@ -60,6 +60,7 @@ HTTP_CHARSET=YES
+ HTTP_GZIP=YES
+ HTTP_SSL=NO
+ HTTP_V2=NO
++HTTP_SPDY=NO
+ HTTP_SSI=YES
+ HTTP_POSTPONE=NO
+ HTTP_REALIP=NO
+@@ -219,6 +220,7 @@ do
+ 
+         --with-http_ssl_module)          HTTP_SSL=YES               ;;
+         --with-http_v2_module)           HTTP_V2=YES                ;;
++        --with-http_spdy_module)         HTTP_SPDY=YES              ;;
+         --with-http_realip_module)       HTTP_REALIP=YES            ;;
+         --with-http_addition_module)     HTTP_ADDITION=YES          ;;
+         --with-http_xslt_module)         HTTP_XSLT=YES              ;;
+@@ -397,6 +399,7 @@ cat << END
+ 
+   --with-http_ssl_module             enable ngx_http_ssl_module
+   --with-http_v2_module              enable ngx_http_v2_module
++  --with-http_spdy_module            enable ngx_http_spdy_module
+   --with-http_realip_module          enable ngx_http_realip_module
+   --with-http_addition_module        enable ngx_http_addition_module
+   --with-http_xslt_module            enable ngx_http_xslt_module
+diff -rupN '--exclude=spdy' a/src/core/ngx_connection.h b/src/core/ngx_connection.h
+--- a/src/core/ngx_connection.h	2016-02-25 01:23:23.000000000 +1030
++++ b/src/core/ngx_connection.h	2016-02-25 23:54:42.712383014 +1030
+@@ -119,6 +119,7 @@ typedef enum {
+ #define NGX_LOWLEVEL_BUFFERED  0x0f
+ #define NGX_SSL_BUFFERED       0x01
+ #define NGX_HTTP_V2_BUFFERED   0x02
++#define NGX_SPDY_BUFFERED      0x02
+ 
+ 
+ struct ngx_connection_s {
+diff -rupN '--exclude=spdy' a/src/http/modules/ngx_http_ssl_module.c b/src/http/modules/ngx_http_ssl_module.c
+--- a/src/http/modules/ngx_http_ssl_module.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/modules/ngx_http_ssl_module.c	2016-02-26 00:29:55.002857297 +1030
+@@ -326,10 +326,10 @@ ngx_http_ssl_alpn_select(ngx_ssl_conn_t
+ #if (NGX_DEBUG)
+     unsigned int            i;
+ #endif
+-#if (NGX_HTTP_V2)
++#if (NGX_HTTP_V2 || NGX_HTTP_SPDY)
+     ngx_http_connection_t  *hc;
+ #endif
+-#if (NGX_HTTP_V2 || NGX_DEBUG)
++#if (NGX_HTTP_V2 || NGX_HTTP_SPDY || NGX_DEBUG)
+     ngx_connection_t       *c;
+ 
+     c = ngx_ssl_get_connection(ssl_conn);
+@@ -342,9 +342,19 @@ ngx_http_ssl_alpn_select(ngx_ssl_conn_t
+     }
+ #endif
+ 
+-#if (NGX_HTTP_V2)
++#if (NGX_HTTP_V2 || NGX_HTTP_SPDY)
+     hc = c->data;
++#endif
+ 
++#if (NGX_HTTP_V2 && NGX_HTTP_SPDY)
++    if (hc->addr_conf->http2 && hc->addr_conf->spdy) {
++        srv =
++           (unsigned char *) NGX_HTTP_V2_ALPN_ADVERTISE NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
++        srvlen = sizeof(NGX_HTTP_V2_ALPN_ADVERTISE NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE) - 1;
++
++    } else
++#endif
++#if (NGX_HTTP_V2)
+     if (hc->addr_conf->http2) {
+         srv =
+            (unsigned char *) NGX_HTTP_V2_ALPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
+@@ -352,6 +362,13 @@ ngx_http_ssl_alpn_select(ngx_ssl_conn_t
+ 
+     } else
+ #endif
++#if (NGX_HTTP_SPDY)
++    if (hc->addr_conf->spdy) {
++        srv = (unsigned char *) NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
++        srvlen = sizeof(NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE) - 1;
++
++    } else
++#endif
+     {
+         srv = (unsigned char *) NGX_HTTP_NPN_ADVERTISE;
+         srvlen = sizeof(NGX_HTTP_NPN_ADVERTISE) - 1;
+@@ -379,19 +396,30 @@ static int
+ ngx_http_ssl_npn_advertised(ngx_ssl_conn_t *ssl_conn,
+     const unsigned char **out, unsigned int *outlen, void *arg)
+ {
+-#if (NGX_HTTP_V2 || NGX_DEBUG)
++#if (NGX_HTTP_V2 || NGX_HTTP_SPDY || NGX_DEBUG)
+     ngx_connection_t  *c;
+ 
+     c = ngx_ssl_get_connection(ssl_conn);
+     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "SSL NPN advertised");
+ #endif
+ 
+-#if (NGX_HTTP_V2)
++#if (NGX_HTTP_V2 || NGX_HTTP_SPDY)
+     {
+     ngx_http_connection_t  *hc;
+ 
+     hc = c->data;
+ 
++#if (NGX_HTTP_V2 && NGX_HTTP_SPDY)
++    if (hc->addr_conf->http2 && hc->addr_conf->spdy) {
++        *out =
++            (unsigned char *) NGX_HTTP_V2_NPN_ADVERTISE NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
++        *outlen = sizeof(NGX_HTTP_V2_NPN_ADVERTISE NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE) - 1;
++
++        return SSL_TLSEXT_ERR_OK;
++    }
++#endif
++
++#if (NGX_HTTP_V2)
+     if (hc->addr_conf->http2) {
+         *out =
+             (unsigned char *) NGX_HTTP_V2_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
+@@ -399,6 +427,17 @@ ngx_http_ssl_npn_advertised(ngx_ssl_conn
+ 
+         return SSL_TLSEXT_ERR_OK;
+     }
++#endif
++
++#if (NGX_HTTP_SPDY)
++    if (hc->addr_conf->spdy) {
++        *out =
++            (unsigned char *) NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE;
++        *outlen = sizeof(NGX_SPDY_NPN_ADVERTISE NGX_HTTP_NPN_ADVERTISE) - 1;
++
++        return SSL_TLSEXT_ERR_OK;
++    }
++#endif
+     }
+ #endif
+ 
+diff -rupN '--exclude=spdy' a/src/http/ngx_http.c b/src/http/ngx_http.c
+--- a/src/http/ngx_http.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http.c	2016-02-25 23:02:31.228854826 +1030
+@@ -1229,6 +1229,9 @@ ngx_http_add_addresses(ngx_conf_t *cf, n
+ #if (NGX_HTTP_V2)
+     ngx_uint_t             http2;
+ #endif
++#if (NGX_HTTP_SPDY)
++    ngx_uint_t             spdy;
++#endif
+ 
+     /*
+      * we cannot compare whole sockaddr struct's as kernel
+@@ -1286,6 +1289,9 @@ ngx_http_add_addresses(ngx_conf_t *cf, n
+ #if (NGX_HTTP_V2)
+         http2 = lsopt->http2 || addr[i].opt.http2;
+ #endif
++#if (NGX_HTTP_SPDY)
++        spdy = lsopt->spdy || addr[i].opt.spdy;
++#endif
+ 
+         if (lsopt->set) {
+ 
+@@ -1320,6 +1326,9 @@ ngx_http_add_addresses(ngx_conf_t *cf, n
+ #if (NGX_HTTP_V2)
+         addr[i].opt.http2 = http2;
+ #endif
++#if (NGX_HTTP_SPDY)
++        addr[i].opt.spdy = spdy;
++#endif
+ 
+         return NGX_OK;
+     }
+@@ -1363,6 +1372,18 @@ ngx_http_add_address(ngx_conf_t *cf, ngx
+ 
+ #endif
+ 
++#if (NGX_HTTP_SPDY && NGX_HTTP_SSL                                            \
++     && !defined TLSEXT_TYPE_application_layer_protocol_negotiation           \
++     && !defined TLSEXT_TYPE_next_proto_neg)
++
++    if (lsopt->spdy && lsopt->ssl) {
++        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
++                           "nginx was built without OpenSSL ALPN or NPN "
++                           "support, SPDY is not enabled for %s", lsopt->addr);
++    }
++
++#endif
++
+     addr = ngx_array_push(&port->addrs);
+     if (addr == NULL) {
+         return NGX_ERROR;
+@@ -1855,6 +1876,9 @@ ngx_http_add_addrs(ngx_conf_t *cf, ngx_h
+ #if (NGX_HTTP_V2)
+         addrs[i].conf.http2 = addr[i].opt.http2;
+ #endif
++#if (NGX_HTTP_SPDY)
++        addrs[i].conf.spdy = addr[i].opt.spdy;
++#endif
+         addrs[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
+ 
+         if (addr[i].hash.buckets == NULL
+@@ -1920,6 +1944,9 @@ ngx_http_add_addrs6(ngx_conf_t *cf, ngx_
+ #if (NGX_HTTP_V2)
+         addrs6[i].conf.http2 = addr[i].opt.http2;
+ #endif
++#if (NGX_HTTP_SPDY)
++        addrs6[i].conf.spdy = addr[i].opt.spdy;
++#endif
+         addrs6[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
+ 
+         if (addr[i].hash.buckets == NULL
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_core_module.c b/src/http/ngx_http_core_module.c
+--- a/src/http/ngx_http_core_module.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_core_module.c	2016-02-25 23:05:15.185667844 +1030
+@@ -2132,6 +2132,13 @@ ngx_http_gzip_ok(ngx_http_request_t *r)
+         return NGX_DECLINED;
+     }
+ 
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        r->gzip_ok = 1;
++        return NGX_OK;
++    }
++#endif
++
+     ae = r->headers_in.accept_encoding;
+     if (ae == NULL) {
+         return NGX_DECLINED;
+@@ -2476,6 +2483,9 @@ ngx_http_subrequest(ngx_http_request_t *
+ #if (NGX_HTTP_V2)
+     sr->stream = r->stream;
+ #endif
++#if (NGX_HTTP_SPDY)
++    sr->spdy_stream = r->spdy_stream;
++#endif
+ 
+     sr->method = NGX_HTTP_GET;
+     sr->http_version = r->http_version;
+@@ -4209,11 +4219,15 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx
+         }
+ 
+         if (ngx_strcmp(value[n].data, "spdy") == 0) {
+-            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+-                               "invalid parameter \"spdy\": "
+-                               "ngx_http_spdy_module was superseded "
+-                               "by ngx_http_v2_module");
++#if (NGX_HTTP_SPDY)
++            lsopt.spdy = 1;
+             continue;
++#else
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "the \"spdy\" parameter requires "
++                               "ngx_http_spdy_module");
++            return NGX_CONF_ERROR;
++#endif
+         }
+ 
+         if (ngx_strncmp(value[n].data, "so_keepalive=", 13) == 0) {
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_core_module.h b/src/http/ngx_http_core_module.h
+--- a/src/http/ngx_http_core_module.h	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_core_module.h	2016-02-25 23:06:05.829918975 +1030
+@@ -82,6 +82,9 @@ typedef struct {
+ #if (NGX_HTTP_V2)
+     unsigned                   http2:1;
+ #endif
++#if (NGX_HTTP_SPDY)
++    unsigned                   spdy:1;
++#endif
+ #if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
+     unsigned                   ipv6only:1;
+ #endif
+@@ -251,6 +254,9 @@ struct ngx_http_addr_conf_s {
+ #if (NGX_HTTP_V2)
+     unsigned                   http2:1;
+ #endif
++#if (NGX_HTTP_SPDY)
++    unsigned                   spdy:1;
++#endif
+     unsigned                   proxy_protocol:1;
+ };
+ 
+diff -rupN '--exclude=spdy' a/src/http/ngx_http.h b/src/http/ngx_http.h
+--- a/src/http/ngx_http.h	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http.h	2016-02-25 23:07:02.186198431 +1030
+@@ -23,6 +23,9 @@ typedef struct ngx_http_chunked_s     ng
+ #if (NGX_HTTP_V2)
+ typedef struct ngx_http_v2_stream_s   ngx_http_v2_stream_t;
+ #endif
++#if (NGX_HTTP_SPDY)
++typedef struct ngx_http_spdy_stream_s  ngx_http_spdy_stream_t;
++#endif
+ 
+ typedef ngx_int_t (*ngx_http_header_handler_pt)(ngx_http_request_t *r,
+     ngx_table_elt_t *h, ngx_uint_t offset);
+@@ -41,6 +44,9 @@ typedef u_char *(*ngx_http_log_handler_p
+ #if (NGX_HTTP_V2)
+ #include <ngx_http_v2.h>
+ #endif
++#if (NGX_HTTP_SPDY)
++#include <ngx_http_spdy.h>
++#endif
+ #if (NGX_HTTP_CACHE)
+ #include <ngx_http_cache.h>
+ #endif
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_request_body.c b/src/http/ngx_http_request_body.c
+--- a/src/http/ngx_http_request_body.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_request_body.c	2016-02-25 23:08:12.950549332 +1030
+@@ -48,6 +48,14 @@ ngx_http_read_client_request_body(ngx_ht
+     }
+ #endif
+ 
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream && r == r->main) {
++        r->request_body_no_buffering = 0;
++        rc = ngx_http_spdy_read_request_body(r, post_handler);
++        goto done;
++    }
++#endif
++
+     if (r != r->main || r->request_body || r->discard_body) {
+         r->request_body_no_buffering = 0;
+         post_handler(r);
+@@ -570,6 +578,13 @@ ngx_http_discard_request_body(ngx_http_r
+         return NGX_OK;
+     }
+ #endif
++
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream && r == r->main) {
++        r->spdy_stream->skip_data = NGX_SPDY_DATA_DISCARD;
++        return NGX_OK;
++    }
++#endif
+ 
+     if (r != r->main || r->discard_body || r->request_body) {
+         return NGX_OK;
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_request.c b/src/http/ngx_http_request.c
+--- a/src/http/ngx_http_request.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_request.c	2016-02-26 00:02:55.062824448 +1030
+@@ -312,6 +312,12 @@ ngx_http_init_connection(ngx_connection_
+     rev->handler = ngx_http_wait_request_handler;
+     c->write->handler = ngx_http_empty_handler;
+ 
++#if (NGX_HTTP_SPDY)
++    if (hc->addr_conf->spdy) {
++        rev->handler = ngx_http_spdy_init;
++    }
++#endif
++
+ #if (NGX_HTTP_V2)
+     if (hc->addr_conf->http2) {
+         rev->handler = ngx_http_v2_init;
+@@ -764,17 +770,27 @@ ngx_http_ssl_handshake_handler(ngx_conne
+ 
+         c->ssl->no_wait_shutdown = 1;
+ 
+-#if (NGX_HTTP_V2                                                              \
++#if ((NGX_HTTP_V2 || NGX_HTTP_SPDY)                                           \
+      && (defined TLSEXT_TYPE_application_layer_protocol_negotiation           \
+          || defined TLSEXT_TYPE_next_proto_neg))
+         {
+         unsigned int            len;
+         const unsigned char    *data;
++#if (NGX_HTTP_SPDY)
++        static const ngx_str_t  spdy = ngx_string(NGX_SPDY_NPN_NEGOTIATED);
++#endif
+         ngx_http_connection_t  *hc;
+ 
+         hc = c->data;
+ 
++
++#if (NGX_HTTP_V2 && NGX_HTTP_SPDY)
++        if (hc->addr_conf->http2 || hc->addr_conf->spdy) {
++#elif (NGX_HTTP_V2)
+         if (hc->addr_conf->http2) {
++#else
++        if (hc->addr_conf->spdy) {
++#endif
+ 
+ #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+             SSL_get0_alpn_selected(c->ssl->connection, &data, &len);
+@@ -789,10 +805,19 @@ ngx_http_ssl_handshake_handler(ngx_conne
+             SSL_get0_next_proto_negotiated(c->ssl->connection, &data, &len);
+ #endif
+ 
+-            if (len == 2 && data[0] == 'h' && data[1] == '2') {
++#if (NGX_HTTP_V2)
++            if (hc->addr_conf->http2 && len == 2 && data[0] == 'h' && data[1] == '2') {
+                 ngx_http_v2_init(c->read);
+                 return;
+             }
++#endif
++
++#if (NGX_HTTP_SPDY)
++            if (hc->addr_conf->spdy && len == spdy.len && ngx_strncmp(data, spdy.data, spdy.len) == 0) {
++                ngx_http_spdy_init(c->read);
++                return;
++            }
++#endif
+         }
+         }
+ #endif
+@@ -2514,6 +2539,13 @@ ngx_http_finalize_connection(ngx_http_re
+     }
+ #endif
+ 
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        ngx_http_close_request(r, 0);
++        return;
++    }
++#endif
++
+     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+ 
+     if (r->main->count != 1) {
+@@ -2573,6 +2605,12 @@ ngx_http_set_write_handler(ngx_http_requ
+                                 ngx_http_test_reading;
+     r->write_event_handler = ngx_http_writer;
+ 
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        return NGX_OK;
++    }
++#endif
++
+     wev = r->connection->write;
+ 
+     if (wev->ready && wev->delayed) {
+@@ -2658,6 +2696,12 @@ ngx_http_writer(ngx_http_request_t *r)
+ 
+     if (r->buffered || r->postponed || (r == r->main && c->buffered)) {
+ 
++#if (NGX_HTTP_SPDY)
++        if (r->spdy_stream) {
++            return;
++        }
++#endif
++
+         if (!wev->delayed) {
+             ngx_add_timer(wev, clcf->send_timeout);
+         }
+@@ -2733,6 +2777,19 @@ ngx_http_test_reading(ngx_http_request_t
+ 
+ #endif
+ 
++#if (NGX_HTTP_SPDY)
++
++    if (r->spdy_stream) {
++        if (c->error) {
++            err = 0;
++            goto closed;
++        }
++
++        return;
++    }
++
++#endif
++
+ #if (NGX_HAVE_KQUEUE)
+ 
+     if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
+@@ -3401,6 +3458,13 @@ ngx_http_close_request(ngx_http_request_
+         return;
+     }
+ #endif
++
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        ngx_http_spdy_close_stream(r->spdy_stream, rc);
++        return;
++    }
++#endif
+ 
+     ngx_http_free_request(r, rc);
+     ngx_http_close_connection(c);
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_request.h b/src/http/ngx_http_request.h
+--- a/src/http/ngx_http_request.h	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_request.h	2016-02-25 23:17:18.129252727 +1030
+@@ -436,6 +436,9 @@ struct ngx_http_request_s {
+ #if (NGX_HTTP_V2)
+     ngx_http_v2_stream_t             *stream;
+ #endif
++#if (NGX_HTTP_SPDY)
++    ngx_http_spdy_stream_t           *spdy_stream;
++#endif
+ 
+     ngx_http_log_handler_pt           log_handler;
+ 
+diff -rupN '--exclude=spdy' a/src/http/ngx_http_upstream.c b/src/http/ngx_http_upstream.c
+--- a/src/http/ngx_http_upstream.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/ngx_http_upstream.c	2016-02-25 23:18:30.317610690 +1030
+@@ -487,6 +487,13 @@ ngx_http_upstream_init(ngx_http_request_
+     }
+ #endif
+ 
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        ngx_http_upstream_init_request(r);
++        return;
++    }
++#endif
++
+     if (c->read->timer_set) {
+         ngx_del_timer(c->read);
+     }
+@@ -1171,6 +1178,12 @@ ngx_http_upstream_check_broken_connectio
+         return;
+     }
+ #endif
++
++#if (NGX_HTTP_SPDY)
++    if (r->spdy_stream) {
++        return;
++    }
++#endif
+ 
+ #if (NGX_HAVE_KQUEUE)
+ 
+diff -rupN '--exclude=spdy' a/src/http/v2/ngx_http_v2_module.c b/src/http/v2/ngx_http_v2_module.c
+--- a/src/http/v2/ngx_http_v2_module.c	2016-02-25 01:23:24.000000000 +1030
++++ b/src/http/v2/ngx_http_v2_module.c	2016-02-26 12:42:15.175303495 +1030
+@@ -33,8 +33,6 @@ static char *ngx_http_v2_pool_size(ngx_c
+ static char *ngx_http_v2_streams_index_mask(ngx_conf_t *cf, void *post,
+     void *data);
+ static char *ngx_http_v2_chunk_size(ngx_conf_t *cf, void *post, void *data);
+-static char *ngx_http_v2_spdy_deprecated(ngx_conf_t *cf, ngx_command_t *cmd,
+-    void *conf);
+ 
+ 
+ static ngx_conf_post_t  ngx_http_v2_recv_buffer_size_post =
+@@ -112,62 +110,6 @@ static ngx_command_t  ngx_http_v2_comman
+       offsetof(ngx_http_v2_loc_conf_t, chunk_size),
+       &ngx_http_v2_chunk_size_post },
+ 
+-    { ngx_string("spdy_recv_buffer_size"),
+-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_MAIN_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_pool_size"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_max_concurrent_streams"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_streams_index_size"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_recv_timeout"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_keepalive_timeout"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_headers_comp"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_SRV_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+-    { ngx_string("spdy_chunk_size"),
+-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+-      ngx_http_v2_spdy_deprecated,
+-      NGX_HTTP_LOC_CONF_OFFSET,
+-      0,
+-      NULL },
+-
+       ngx_null_command
+ };
+ 
+@@ -456,14 +398,3 @@ ngx_http_v2_chunk_size(ngx_conf_t *cf, v
+ 
+     return NGX_CONF_OK;
+ }
+-
+-
+-static char *
+-ngx_http_v2_spdy_deprecated(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+-{
+-    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+-                       "invalid directive \"%V\": ngx_http_spdy_module "
+-                       "was superseded by ngx_http_v2_module", &cmd->name);
+-
+-    return NGX_CONF_OK;
+-}
